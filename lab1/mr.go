@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/rpc"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -94,6 +95,20 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 
 	c.serve()
 	return c
+}
+
+func defaultMap(filename string, contents string) []KeyValue {
+	words := strings.Fields(contents)
+	var kva []KeyValue
+	for _, w := range words {
+		kv := KeyValue{w, "1"}
+		kva = append(kva, kv)
+	}
+	return kva
+}
+
+func defaultReduce(key string, values []string) string {
+	return fmt.Sprintf("%d", len(values))
 }
 
 // RequestTask RPC handler, handles the worker request task.

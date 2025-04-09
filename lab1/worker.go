@@ -24,9 +24,14 @@ type MapFunc func(string, string) []KeyValue
 type ReduceFunc func(string, []string) string
 
 // WorkerMain starts the worker process.
-func WorkerMain(mapf MapFunc, reducef ReduceFunc) {
+func WorkerMain(opts ...Option) {
+	opt := defaultOption()
+	for _, o := range opts {
+		o(opt)
+	}
+
 	w := &Worker{}
-	w.run(mapf, reducef)
+	w.run(opt.mapFunc, opt.reduceFunc)
 }
 
 // run worker's main loop

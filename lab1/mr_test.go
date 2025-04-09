@@ -129,7 +129,7 @@ func TestMapReduce(t *testing.T) {
 	// 启动多个worker
 	nWorker := 3
 	for i := 0; i < nWorker; i++ {
-		go WorkerMain(MapTest, ReduceTest)
+		go WorkerMain(WithMapFunc(MapTest), WithReduceFunc(ReduceTest))
 	}
 
 	// 等待任务完成
@@ -161,7 +161,7 @@ func TestFaultTolerance(t *testing.T) {
 	// 启动worker并模拟故障
 	for i := 0; i < 5; i++ {
 		go func() {
-			WorkerMain(MapTest, ReduceTest)
+			WorkerMain(WithMapFunc(MapTest), WithReduceFunc(ReduceTest))
 			// 模拟worker故障
 			time.Sleep(time.Second * 2)
 		}()
@@ -196,7 +196,7 @@ func TestConcurrency(t *testing.T) {
 	// 启动多个worker
 	nWorker := 10
 	for i := 0; i < nWorker; i++ {
-		go WorkerMain(MapTest, ReduceTest)
+		go WorkerMain(WithMapFunc(MapTest), WithReduceFunc(ReduceTest))
 	}
 
 	// 等待任务完成
