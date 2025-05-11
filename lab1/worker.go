@@ -17,7 +17,13 @@ type KeyValue struct {
 }
 
 type Worker struct {
-	id int
+	id              int
+	mapFunc         MapFunc
+	reduceFunc      ReduceFunc
+	lastTask        Task
+	maxRetries      int
+	heartbeatPeriod time.Duration
+	stopHeartbeat   chan struct{}
 }
 
 type MapFunc func(string, string) []KeyValue
@@ -30,62 +36,130 @@ func StartWorker(opts ...Option) {
 		o(opt)
 	}
 
-	w := &Worker{}
-	w.run(opt.mapFunc, opt.reduceFunc)
+	w := &Worker{
+		mapFunc:         opt.mapFunc,
+		reduceFunc:      opt.reduceFunc,
+		maxRetries:      3,
+		heartbeatPeriod: 3 * time.Second,
+		stopHeartbeat:   make(chan struct{}),
+	}
+
+	// Get worker ID from master
+	w.register()
+
+	// Start heartbeat goroutine
+	go w.sendHeartbeats()
+
+	defer func() {
+		// Signal heartbeat goroutine to stop
+		close(w.stopHeartbeat)
+	}()
+
+	w.run()
+}
+
+// register registers this worker with the master
+// and obtains the corresponding unique ID
+func (w *Worker) register() {
+	args := RequestTaskArgs{WorkerId: -1} // -1 indicates new worker
+	reply := RequestTaskReply{}
+
+	// Keep retrying until we successfully connect
+	for {
+		ok := call("Master.RequestTask", &args, &reply)
+		if ok {
+			w.id = reply.WorkerId
+			log.Printf("Worker registered with master, assigned ID: %d", w.id)
+			return
+		}
+		log.Printf("Failed to register with master, retrying...")
+		time.Sleep(time.Second)
+	}
+}
+
+// sendHeartbeats periodically sends heartbeats to let the master know this worker is alive
+func (w *Worker) sendHeartbeats() {
+	for {
+		select {
+		case <-w.stopHeartbeat:
+			return
+		case <-time.After(w.heartbeatPeriod):
+			args := HeartbeatArgs{WorkerId: w.id}
+			reply := HeartbeatReply{}
+
+			ok := call("Master.Heartbeat", &args, &reply)
+			if !ok {
+				log.Printf("Failed to send heartbeat to master")
+			}
+		}
+	}
 }
 
 // run worker's main loop
-func (w *Worker) run(mapf MapFunc, reducef ReduceFunc) {
+func (w *Worker) run() {
 	for {
 		// request task
-		task := w.requestTask()
+		task, success := w.requestTask()
+		if !success {
+			log.Printf("Failed to request task, retrying in 1 second...")
+			time.Sleep(time.Second)
+			continue
+		}
+
 		if task.Type == NoTask {
 			time.Sleep(time.Second)
 			continue
 		}
 
+		w.lastTask = task
+
 		// execute task
-		success := false
+		var taskSuccess bool
 		if task.Type == MapTask {
-			success = w.Map(mapf, task)
+			taskSuccess = w.Map(task)
 		} else if task.Type == ReduceTask {
-			success = w.Reduce(reducef, task)
+			taskSuccess = w.Reduce(task)
 		}
 
 		// reporting on mandate completion
-		w.reportTask(task.TaskId, success)
+		reportSuccess := w.reportTask(task.TaskId, taskSuccess)
+		if !reportSuccess {
+			log.Printf("Failed to report task completion, will retry in next loop")
+		}
+
+		// Brief pause to prevent hammering the master
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
 // requestTask request a task from the master
-func (w *Worker) requestTask() Task {
-	args := RequestTaskArgs{}
+func (w *Worker) requestTask() (Task, bool) {
+	args := RequestTaskArgs{WorkerId: w.id}
 	reply := RequestTaskReply{}
 
-	ok := call("Coordinator.RequestTask", &args, &reply)
+	ok := call("Master.RequestTask", &args, &reply)
 	if !ok {
-		log.Fatal("RequestTask failed")
+		return Task{}, false
 	}
 
-	return reply.Task
+	return reply.Task, true
 }
 
 // reportTask reports the completion of the task to the master.
-func (w *Worker) reportTask(taskId int, success bool) {
+func (w *Worker) reportTask(taskId int, success bool) bool {
 	args := ReportTaskArgs{
-		TaskId:  taskId,
-		Success: success,
+		TaskId:   taskId,
+		WorkerId: w.id,
+		Success:  success,
 	}
 	reply := ReportTaskReply{}
 
-	ok := call("Coordinator.ReportTask", &args, &reply)
-	if !ok {
-		log.Fatal("ReportTask failed")
-	}
+	ok := call("Master.ReportTask", &args, &reply)
+	return ok
 }
 
 // Map performs the map task
-func (w *Worker) Map(mapf MapFunc, task Task) bool {
+func (w *Worker) Map(task Task) bool {
 	// read the input file
 	content, err := os.ReadFile(task.Filename)
 	if err != nil {
@@ -94,7 +168,7 @@ func (w *Worker) Map(mapf MapFunc, task Task) bool {
 	}
 
 	// execute the map
-	kva := mapf(task.Filename, string(content))
+	kva := w.mapFunc(task.Filename, string(content))
 
 	// create intermediate files
 	intermediate := make([][]KeyValue, task.NReduce)
@@ -103,39 +177,83 @@ func (w *Worker) Map(mapf MapFunc, task Task) bool {
 		intermediate[reduceTask] = append(intermediate[reduceTask], kv)
 	}
 
-	// write in intermediate files
+	// Use a more robust naming scheme for intermediate files that includes worker ID
+	// This helps prevent different workers from overwriting each other's files
+	tempFiles := make([]*os.File, task.NReduce)
+	tempFilenames := make([]string, task.NReduce)
+
 	for i := 0; i < task.NReduce; i++ {
-		filename := fmt.Sprintf("mr-%d-%d", task.TaskId, i)
-		file, err := os.Create(filename)
+		// First create temporary files
+		tempFile, err := os.CreateTemp("", "map-")
 		if err != nil {
-			log.Printf("Cannot create file %v", filename)
+			log.Printf("Cannot create temp file: %v", err)
+			// Clean up any created files
+			for j := 0; j < i; j++ {
+				tempFiles[j].Close()
+				os.Remove(tempFilenames[j])
+			}
 			return false
 		}
-		enc := json.NewEncoder(file)
+		tempFiles[i] = tempFile
+		tempFilenames[i] = tempFile.Name()
+
+		// Write data to temp files
+		enc := json.NewEncoder(tempFile)
 		for _, kv := range intermediate[i] {
-			err := enc.Encode(&kv)
-			if err != nil {
-				log.Printf("Cannot encode %v", kv)
+			if err := enc.Encode(&kv); err != nil {
+				log.Printf("Cannot encode %v: %v", kv, err)
+				// Clean up
+				for j := 0; j <= i; j++ {
+					tempFiles[j].Close()
+					os.Remove(tempFilenames[j])
+				}
 				return false
 			}
 		}
-		file.Close()
+		tempFile.Close()
+	}
+
+	// Now atomically rename the files to their final names
+	for i := 0; i < task.NReduce; i++ {
+		finalName := fmt.Sprintf("mr-%d-%d", task.TaskId, i)
+		if err := os.Rename(tempFilenames[i], finalName); err != nil {
+			log.Printf("Cannot rename temp file %s to %s: %v", tempFilenames[i], finalName, err)
+			// We can't easily roll back at this point
+			return false
+		}
 	}
 
 	return true
 }
 
 // Reduce performs the reduce task.
-func (w *Worker) Reduce(reducef ReduceFunc, task Task) bool {
+func (w *Worker) Reduce(task Task) bool {
 	// Read the output of all map tasks
 	var intermediate []KeyValue
 	for i := 0; i < task.NMap; i++ {
 		filename := fmt.Sprintf("mr-%d-%d", i, task.TaskId)
 		file, err := os.Open(filename)
 		if err != nil {
-			log.Printf("Cannot open file %v", filename)
-			return false
+			log.Printf("Cannot open file %v: %v", filename, err)
+
+			// Be more resilient - try a few times with backoff
+			retryCount := 0
+			for retryCount < w.maxRetries {
+				time.Sleep(time.Second * time.Duration(retryCount+1))
+				file, err = os.Open(filename)
+				if err == nil {
+					break
+				}
+				retryCount++
+				log.Printf("Retry %d: Cannot open file %v: %v", retryCount, filename, err)
+			}
+
+			// If we still can't open it after retries, report failure
+			if err != nil {
+				return false
+			}
 		}
+
 		dec := json.NewDecoder(file)
 		for {
 			var kv KeyValue
@@ -152,15 +270,15 @@ func (w *Worker) Reduce(reducef ReduceFunc, task Task) bool {
 		return intermediate[i].Key < intermediate[j].Key
 	})
 
-	// create the output file
-	outFile := fmt.Sprintf("mr-out-%d", task.TaskId)
-	ofile, err := os.Create(outFile)
+	// Create a temporary file first for atomicity
+	tempFile, err := os.CreateTemp("", "reduce-")
 	if err != nil {
-		log.Printf("Cannot create file %v", outFile)
+		log.Printf("Cannot create temp file: %v", err)
 		return false
 	}
+	tempFilename := tempFile.Name()
 
-	// execute reduce
+	// Execute reduce and write to temp file
 	i := 0
 	for i < len(intermediate) {
 		j := i + 1
@@ -171,12 +289,22 @@ func (w *Worker) Reduce(reducef ReduceFunc, task Task) bool {
 		for k := i; k < j; k++ {
 			values = append(values, intermediate[k].Value)
 		}
-		output := reducef(intermediate[i].Key, values)
-		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+		output := w.reduceFunc(intermediate[i].Key, values)
+		fmt.Fprintf(tempFile, "%v %v\n", intermediate[i].Key, output)
 		i = j
 	}
 
-	ofile.Close()
+	tempFile.Close()
+
+	// Rename temp file to final output
+	finalOutFile := fmt.Sprintf("mr-out-%d", task.TaskId)
+	err = os.Rename(tempFilename, finalOutFile)
+	if err != nil {
+		log.Printf("Cannot rename temp file %s to %s: %v", tempFilename, finalOutFile, err)
+		os.Remove(tempFilename) // Clean up the temp file
+		return false
+	}
+
 	return true
 }
 
@@ -191,7 +319,7 @@ func ihash(key string) int {
 func call(rpcname string, args interface{}, reply interface{}) bool {
 	maxRetries := 3
 	for i := 0; i < maxRetries; i++ {
-		c, err := rpc.DialHTTP("unix", coordinatorSock())
+		c, err := rpc.DialHTTP("unix", masterSock())
 		if err != nil {
 			log.Printf("dialing error (attempt %d/%d): %v", i+1, maxRetries, err)
 			time.Sleep(time.Second)

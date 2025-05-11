@@ -13,33 +13,9 @@ import (
 )
 
 var (
-	socketMutex       sync.Mutex
-	coordinatorSocket string
+	socketMutex  sync.Mutex
+	masterSocket string
 )
-
-type TaskType int
-
-const (
-	MapTask TaskType = iota
-	ReduceTask
-	NoTask
-)
-
-type Task struct {
-	Type      TaskType
-	TaskId    int
-	Filename  string
-	NReduce   int
-	NMap      int
-	Completed bool
-}
-
-type TaskStatus struct {
-	TaskId    int
-	StartTime time.Time
-	Completed bool
-	Filename  string
-}
 
 // Master controller node
 type Master struct {
@@ -53,48 +29,8 @@ type Master struct {
 	completedReduces int
 	listener         net.Listener
 	httpServer       *http.Server
-}
-
-// RequestTaskArgs request task arguments
-type RequestTaskArgs struct {
-}
-
-// RequestTaskReply The response to a request task.
-type RequestTaskReply struct {
-	Task Task
-}
-
-// ReportTaskArgs Parameters for reporting task completion
-type ReportTaskArgs struct {
-	TaskId  int
-	Success bool
-}
-
-// ReportTaskReply reports the task completion response
-type ReportTaskReply struct {
-}
-
-// NewMaster creates a master node.
-func NewMaster(files []string, nReduce int) *Master {
-	c := &Master{
-		mapTasks:    make(map[int]*TaskStatus),
-		reduceTasks: make(map[int]*TaskStatus),
-		nMap:        len(files),
-		nReduce:     nReduce,
-		phase:       MapTask,
-	}
-
-	for i, file := range files {
-		c.mapTasks[i] = &TaskStatus{
-			TaskId:    i,
-			StartTime: time.Now(),
-			Completed: false,
-			Filename:  file,
-		}
-	}
-
-	c.serve()
-	return c
+	nextWorkerId     int               // For assigning unique worker IDs
+	workers          map[int]time.Time // Track last heartbeat from each worker
 }
 
 func defaultMap(filename string, contents string) []KeyValue {
@@ -111,15 +47,70 @@ func defaultReduce(key string, values []string) string {
 	return fmt.Sprintf("%d", len(values))
 }
 
-// RequestTask RPC handler, handles the worker request task.
-func (m *Master) RequestTask(reply *RequestTaskReply) error {
+// NewMaster creates a master node.
+func NewMaster(files []string, nReduce int) *Master {
+	c := &Master{
+		mapTasks:    make(map[int]*TaskStatus),
+		reduceTasks: make(map[int]*TaskStatus),
+		nMap:        len(files),
+		nReduce:     nReduce,
+		phase:       MapTask,
+		workers:     make(map[int]time.Time),
+	}
+
+	for i, file := range files {
+		c.mapTasks[i] = &TaskStatus{
+			TaskId:     i,
+			State:      TaskIdle,
+			StartTime:  time.Time{},
+			Completed:  false,
+			Filename:   file,
+			RetryCount: 0,
+			MaxRetries: 3, // Allow up to 3 retries
+		}
+	}
+
+	// Start a goroutine to check for worker timeouts
+	go c.checkTimeouts()
+
+	c.serve()
+	return c
+}
+
+// Heartbeat handles worker heartbeats to detect failures
+func (m *Master) Heartbeat(args *HeartbeatArgs, reply *HeartbeatReply) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	m.workers[args.WorkerId] = time.Now()
+	return nil
+}
+
+// RequestTask RPC handler, handles the worker request task.
+func (m *Master) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Handle new worker registration
+	if args.WorkerId == -1 {
+		// Assign new worker ID
+		newWorkerId := m.nextWorkerId
+		m.nextWorkerId++
+		m.workers[newWorkerId] = time.Now()
+		reply.WorkerId = newWorkerId
+		log.Printf("New worker registered with ID: %d", newWorkerId)
+	} else {
+		// Update existing worker's last seen time
+		m.workers[args.WorkerId] = time.Now()
+	}
+
 	if m.phase == MapTask {
 		for taskId, status := range m.mapTasks {
-			if !status.Completed && time.Since(status.StartTime) > 10*time.Second {
+			if status.State == TaskIdle || (status.State == TaskFailed && status.RetryCount < status.MaxRetries) {
+				status.State = TaskInProgress
 				status.StartTime = time.Now()
+				status.WorkerId = args.WorkerId
+
 				reply.Task = Task{
 					Type:     MapTask,
 					TaskId:   taskId,
@@ -127,19 +118,24 @@ func (m *Master) RequestTask(reply *RequestTaskReply) error {
 					NReduce:  m.nReduce,
 					NMap:     m.nMap,
 				}
+				log.Printf("Assigned map task %d to worker %d", taskId, args.WorkerId)
 				return nil
 			}
 		}
 	} else if m.phase == ReduceTask {
 		for taskId, status := range m.reduceTasks {
-			if !status.Completed && time.Since(status.StartTime) > 10*time.Second {
+			if status.State == TaskIdle || (status.State == TaskFailed && status.RetryCount < status.MaxRetries) {
+				status.State = TaskInProgress
 				status.StartTime = time.Now()
+				status.WorkerId = args.WorkerId
+
 				reply.Task = Task{
 					Type:    ReduceTask,
 					TaskId:  taskId,
 					NReduce: m.nReduce,
 					NMap:    m.nMap,
 				}
+				log.Printf("Assigned reduce task %d to worker %d", taskId, args.WorkerId)
 				return nil
 			}
 		}
@@ -150,28 +146,33 @@ func (m *Master) RequestTask(reply *RequestTaskReply) error {
 }
 
 // ReportTask RPC handler, handles the worker reporting the completion of the task.
-func (m *Master) ReportTask(args *ReportTaskArgs) error {
+func (m *Master) ReportTask(args *ReportTaskArgs, reply *ReportTaskReply) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if args.Success {
 		if m.phase == MapTask {
-			if status, ok := m.mapTasks[args.TaskId]; ok && !status.Completed {
+			if status, ok := m.mapTasks[args.TaskId]; ok && status.State == TaskInProgress {
+				status.State = TaskCompleted
 				status.Completed = true
 				m.completedMaps++
 				if m.completedMaps == m.nMap {
 					m.phase = ReduceTask
 					for i := 0; i < m.nReduce; i++ {
 						m.reduceTasks[i] = &TaskStatus{
-							TaskId:    i,
-							StartTime: time.Now(),
-							Completed: false,
+							TaskId:     i,
+							State:      TaskIdle,
+							StartTime:  time.Time{},
+							Completed:  false,
+							RetryCount: 0,
+							MaxRetries: 3,
 						}
 					}
 				}
 			}
 		} else if m.phase == ReduceTask {
-			if status, ok := m.reduceTasks[args.TaskId]; ok && !status.Completed {
+			if status, ok := m.reduceTasks[args.TaskId]; ok && status.State == TaskInProgress {
+				status.State = TaskCompleted
 				status.Completed = true
 				m.completedReduces++
 				if m.completedReduces == m.nReduce {
@@ -183,6 +184,71 @@ func (m *Master) ReportTask(args *ReportTaskArgs) error {
 	return nil
 }
 
+// checkTimeouts periodically checks for worker timeouts and reassigns tasks
+func (m *Master) checkTimeouts() {
+	for {
+		time.Sleep(3 * time.Second) // Check every 3 seconds
+
+		if m.Done() {
+			return
+		}
+
+		m.mu.Lock()
+
+		// Check for worker timeouts
+		for workerId, lastSeen := range m.workers {
+			if time.Since(lastSeen) > 10*time.Second {
+				log.Printf("Worker %d appears to have died, reassigning its tasks", workerId)
+				// Reassign all tasks from this worker
+				m.reassignTasksFromWorker(workerId)
+				delete(m.workers, workerId)
+			}
+		}
+
+		// Check for task timeouts
+		now := time.Now()
+
+		if m.phase == MapTask {
+			for _, task := range m.mapTasks {
+				if task.State == TaskInProgress && now.Sub(task.StartTime) > 10*time.Second {
+					log.Printf("Map task %d timed out, marking for reassignment", task.TaskId)
+					task.State = TaskFailed
+					task.RetryCount++
+				}
+			}
+		} else if m.phase == ReduceTask {
+			for _, task := range m.reduceTasks {
+				if task.State == TaskInProgress && now.Sub(task.StartTime) > 10*time.Second {
+					log.Printf("Reduce task %d timed out, marking for reassignment", task.TaskId)
+					task.State = TaskFailed
+					task.RetryCount++
+				}
+			}
+		}
+
+		m.mu.Unlock()
+	}
+}
+
+// reassignTasksFromWorker marks all tasks assigned to a worker as failed
+func (m *Master) reassignTasksFromWorker(workerId int) {
+	if m.phase == MapTask {
+		for _, task := range m.mapTasks {
+			if task.State == TaskInProgress && task.WorkerId == workerId {
+				task.State = TaskFailed
+				task.RetryCount++
+			}
+		}
+	} else if m.phase == ReduceTask {
+		for _, task := range m.reduceTasks {
+			if task.State == TaskInProgress && task.WorkerId == workerId {
+				task.State = TaskFailed
+				task.RetryCount++
+			}
+		}
+	}
+}
+
 // serve Starts the RPC server
 func (m *Master) serve() {
 	rpc.Register(m)
@@ -190,7 +256,7 @@ func (m *Master) serve() {
 	mux := http.NewServeMux()
 	mux.Handle("/_goRPC_", rpc.DefaultServer)
 
-	sockname := coordinatorSock()
+	sockname := masterSock()
 
 	if err := os.RemoveAll(sockname); err != nil {
 		log.Printf("Remove socket file error: %v", err)
@@ -231,17 +297,17 @@ func (m *Master) cleanup() {
 	}
 
 	// Clean up the socket file
-	os.RemoveAll(coordinatorSock())
+	os.RemoveAll(masterSock())
 }
 
-// coordinatorSock returns coordinator's socket file name
-func coordinatorSock() string {
+// masterSock returns coordinator's socket file name
+func masterSock() string {
 	socketMutex.Lock()
 	defer socketMutex.Unlock()
 
-	if coordinatorSocket == "" {
+	if masterSocket == "" {
 		timestamp := fmt.Sprintf("%d", time.Now().UnixNano())
-		coordinatorSocket = fmt.Sprintf("/tmp/824-mr-%d-%s", os.Getuid(), timestamp)
+		masterSocket = fmt.Sprintf("/tmp/824-mr-%d-%s", os.Getuid(), timestamp)
 	}
-	return coordinatorSocket
+	return masterSocket
 }

@@ -115,7 +115,7 @@ func checkOutput(t *testing.T, nReduce int) {
 // 主测试函数
 func TestMapReduce(t *testing.T) {
 	// 清理可能存在的socket文件
-	coordinatorSocket = ""        // 重置socket文件名
+	masterSocket = ""             // 重置socket文件名
 	os.RemoveAll("/tmp/824-mr-*") // 清理所有可能的socket文件
 
 	// 创建测试文件
@@ -124,7 +124,7 @@ func TestMapReduce(t *testing.T) {
 
 	// 启动 master
 	nReduce := 10
-	coordinator := NewMaster(files, nReduce)
+	master := NewMaster(files, nReduce)
 
 	// 启动多个worker
 	nWorker := 3
@@ -133,7 +133,7 @@ func TestMapReduce(t *testing.T) {
 	}
 
 	// 等待任务完成
-	for !coordinator.Done() {
+	for !master.Done() {
 		time.Sleep(time.Second)
 	}
 
@@ -141,13 +141,13 @@ func TestMapReduce(t *testing.T) {
 	checkOutput(t, nReduce)
 
 	// 清理socket文件
-	os.RemoveAll(coordinatorSock())
+	master.cleanup()
 }
 
 // 测试容错性
 func TestFaultTolerance(t *testing.T) {
 	// 清理可能存在的socket文件
-	coordinatorSocket = ""        // 重置socket文件名
+	masterSocket = ""             // 重置socket文件名
 	os.RemoveAll("/tmp/824-mr-*") // 清理所有可能的socket文件
 
 	// 创建测试文件
@@ -156,7 +156,7 @@ func TestFaultTolerance(t *testing.T) {
 
 	// 启动 master
 	nReduce := 10
-	coordinator := NewMaster(files, nReduce)
+	master := NewMaster(files, nReduce)
 
 	// 启动worker并模拟故障
 	for i := 0; i < 5; i++ {
@@ -168,7 +168,7 @@ func TestFaultTolerance(t *testing.T) {
 	}
 
 	// 等待任务完成
-	for !coordinator.Done() {
+	for !master.Done() {
 		time.Sleep(time.Second)
 	}
 
@@ -176,13 +176,13 @@ func TestFaultTolerance(t *testing.T) {
 	checkOutput(t, nReduce)
 
 	// 清理socket文件
-	os.RemoveAll(coordinatorSock())
+	master.cleanup()
 }
 
 // 测试并发性
 func TestConcurrency(t *testing.T) {
 	// 清理可能存在的socket文件
-	coordinatorSocket = ""        // 重置socket文件名
+	masterSocket = ""             // 重置socket文件名
 	os.RemoveAll("/tmp/824-mr-*") // 清理所有可能的socket文件
 
 	// 创建测试文件
@@ -191,7 +191,7 @@ func TestConcurrency(t *testing.T) {
 
 	// 启动 master
 	nReduce := 10
-	coordinator := NewMaster(files, nReduce)
+	master := NewMaster(files, nReduce)
 
 	// 启动多个worker
 	nWorker := 10
@@ -200,7 +200,7 @@ func TestConcurrency(t *testing.T) {
 	}
 
 	// 等待任务完成
-	for !coordinator.Done() {
+	for !master.Done() {
 		time.Sleep(time.Second)
 	}
 
@@ -208,5 +208,5 @@ func TestConcurrency(t *testing.T) {
 	checkOutput(t, nReduce)
 
 	// 清理socket文件
-	os.RemoveAll(coordinatorSock())
+	master.cleanup()
 }
