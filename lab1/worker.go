@@ -23,8 +23,8 @@ type Worker struct {
 type MapFunc func(string, string) []KeyValue
 type ReduceFunc func(string, []string) string
 
-// WorkerMain starts the worker process.
-func WorkerMain(opts ...Option) {
+// StartWorker starts the worker process.
+func StartWorker(opts ...Option) {
 	opt := defaultOption()
 	for _, o := range opts {
 		o(opt)

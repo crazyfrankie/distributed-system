@@ -122,14 +122,14 @@ func TestMapReduce(t *testing.T) {
 	files := createTestFiles(t)
 	defer cleanupTestFiles(t, files)
 
-	// 启动coordinator
+	// 启动 master
 	nReduce := 10
-	coordinator := MakeCoordinator(files, nReduce)
+	coordinator := NewMaster(files, nReduce)
 
 	// 启动多个worker
 	nWorker := 3
 	for i := 0; i < nWorker; i++ {
-		go WorkerMain(WithMapFunc(MapTest), WithReduceFunc(ReduceTest))
+		go StartWorker(WithMapFunc(MapTest), WithReduceFunc(ReduceTest))
 	}
 
 	// 等待任务完成
@@ -154,14 +154,14 @@ func TestFaultTolerance(t *testing.T) {
 	files := createTestFiles(t)
 	defer cleanupTestFiles(t, files)
 
-	// 启动coordinator
+	// 启动 master
 	nReduce := 10
-	coordinator := MakeCoordinator(files, nReduce)
+	coordinator := NewMaster(files, nReduce)
 
 	// 启动worker并模拟故障
 	for i := 0; i < 5; i++ {
 		go func() {
-			WorkerMain(WithMapFunc(MapTest), WithReduceFunc(ReduceTest))
+			StartWorker(WithMapFunc(MapTest), WithReduceFunc(ReduceTest))
 			// 模拟worker故障
 			time.Sleep(time.Second * 2)
 		}()
@@ -189,14 +189,14 @@ func TestConcurrency(t *testing.T) {
 	files := createTestFiles(t)
 	defer cleanupTestFiles(t, files)
 
-	// 启动coordinator
+	// 启动 master
 	nReduce := 10
-	coordinator := MakeCoordinator(files, nReduce)
+	coordinator := NewMaster(files, nReduce)
 
 	// 启动多个worker
 	nWorker := 10
 	for i := 0; i < nWorker; i++ {
-		go WorkerMain(WithMapFunc(MapTest), WithReduceFunc(ReduceTest))
+		go StartWorker(WithMapFunc(MapTest), WithReduceFunc(ReduceTest))
 	}
 
 	// 等待任务完成

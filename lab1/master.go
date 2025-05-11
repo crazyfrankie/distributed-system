@@ -41,8 +41,8 @@ type TaskStatus struct {
 	Filename  string
 }
 
-// Coordinator master node
-type Coordinator struct {
+// Master controller node
+type Master struct {
 	mu               sync.Mutex
 	mapTasks         map[int]*TaskStatus
 	reduceTasks      map[int]*TaskStatus
@@ -74,9 +74,9 @@ type ReportTaskArgs struct {
 type ReportTaskReply struct {
 }
 
-// MakeCoordinator creates a master node.
-func MakeCoordinator(files []string, nReduce int) *Coordinator {
-	c := &Coordinator{
+// NewMaster creates a master node.
+func NewMaster(files []string, nReduce int) *Master {
+	c := &Master{
 		mapTasks:    make(map[int]*TaskStatus),
 		reduceTasks: make(map[int]*TaskStatus),
 		nMap:        len(files),
@@ -112,33 +112,33 @@ func defaultReduce(key string, values []string) string {
 }
 
 // RequestTask RPC handler, handles the worker request task.
-func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+func (m *Master) RequestTask(reply *RequestTaskReply) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-	if c.phase == MapTask {
-		for taskId, status := range c.mapTasks {
+	if m.phase == MapTask {
+		for taskId, status := range m.mapTasks {
 			if !status.Completed && time.Since(status.StartTime) > 10*time.Second {
 				status.StartTime = time.Now()
 				reply.Task = Task{
 					Type:     MapTask,
 					TaskId:   taskId,
 					Filename: status.Filename,
-					NReduce:  c.nReduce,
-					NMap:     c.nMap,
+					NReduce:  m.nReduce,
+					NMap:     m.nMap,
 				}
 				return nil
 			}
 		}
-	} else if c.phase == ReduceTask {
-		for taskId, status := range c.reduceTasks {
+	} else if m.phase == ReduceTask {
+		for taskId, status := range m.reduceTasks {
 			if !status.Completed && time.Since(status.StartTime) > 10*time.Second {
 				status.StartTime = time.Now()
 				reply.Task = Task{
 					Type:    ReduceTask,
 					TaskId:  taskId,
-					NReduce: c.nReduce,
-					NMap:    c.nMap,
+					NReduce: m.nReduce,
+					NMap:    m.nMap,
 				}
 				return nil
 			}
@@ -150,19 +150,19 @@ func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply
 }
 
 // ReportTask RPC handler, handles the worker reporting the completion of the task.
-func (c *Coordinator) ReportTask(args *ReportTaskArgs, reply *ReportTaskReply) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+func (m *Master) ReportTask(args *ReportTaskArgs) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
 	if args.Success {
-		if c.phase == MapTask {
-			if status, ok := c.mapTasks[args.TaskId]; ok && !status.Completed {
+		if m.phase == MapTask {
+			if status, ok := m.mapTasks[args.TaskId]; ok && !status.Completed {
 				status.Completed = true
-				c.completedMaps++
-				if c.completedMaps == c.nMap {
-					c.phase = ReduceTask
-					for i := 0; i < c.nReduce; i++ {
-						c.reduceTasks[i] = &TaskStatus{
+				m.completedMaps++
+				if m.completedMaps == m.nMap {
+					m.phase = ReduceTask
+					for i := 0; i < m.nReduce; i++ {
+						m.reduceTasks[i] = &TaskStatus{
 							TaskId:    i,
 							StartTime: time.Now(),
 							Completed: false,
@@ -170,12 +170,12 @@ func (c *Coordinator) ReportTask(args *ReportTaskArgs, reply *ReportTaskReply) e
 					}
 				}
 			}
-		} else if c.phase == ReduceTask {
-			if status, ok := c.reduceTasks[args.TaskId]; ok && !status.Completed {
+		} else if m.phase == ReduceTask {
+			if status, ok := m.reduceTasks[args.TaskId]; ok && !status.Completed {
 				status.Completed = true
-				c.completedReduces++
-				if c.completedReduces == c.nReduce {
-					c.phase = NoTask
+				m.completedReduces++
+				if m.completedReduces == m.nReduce {
+					m.phase = NoTask
 				}
 			}
 		}
@@ -184,8 +184,8 @@ func (c *Coordinator) ReportTask(args *ReportTaskArgs, reply *ReportTaskReply) e
 }
 
 // serve Starts the RPC server
-func (c *Coordinator) serve() {
-	rpc.Register(c)
+func (m *Master) serve() {
+	rpc.Register(m)
 
 	mux := http.NewServeMux()
 	mux.Handle("/_goRPC_", rpc.DefaultServer)
@@ -201,33 +201,33 @@ func (c *Coordinator) serve() {
 		log.Fatal("listen error:", e)
 	}
 
-	c.listener = l
+	m.listener = l
 
-	c.httpServer = &http.Server{
+	m.httpServer = &http.Server{
 		Handler: mux,
 	}
 
-	go c.httpServer.Serve(l)
+	go m.httpServer.Serve(l)
 }
 
 // Done Checks that all tasks are completed
-func (c *Coordinator) Done() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.phase == NoTask
+func (m *Master) Done() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.phase == NoTask
 }
 
 // cleanup cleaning up the RPC server and related resources
-func (c *Coordinator) cleanup() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+func (m *Master) cleanup() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-	if c.listener != nil {
-		c.listener.Close()
+	if m.listener != nil {
+		m.listener.Close()
 	}
 
-	if c.httpServer != nil {
-		c.httpServer.Close()
+	if m.httpServer != nil {
+		m.httpServer.Close()
 	}
 
 	// Clean up the socket file
